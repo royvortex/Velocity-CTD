@@ -39,6 +39,7 @@ import com.velocitypowered.proxy.connection.util.ConnectionRequestResults;
 import com.velocitypowered.proxy.connection.util.ConnectionRequestResults.Impl;
 import com.velocitypowered.proxy.network.Connections;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
+import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
 import com.velocitypowered.proxy.protocol.netty.MinecraftVarintFrameDecoder;
@@ -55,15 +56,18 @@ import com.velocitypowered.proxy.protocol.packet.config.ClientboundCustomReportD
 import com.velocitypowered.proxy.protocol.packet.config.ClientboundServerLinksPacket;
 import com.velocitypowered.proxy.protocol.packet.config.CodeOfConductPacket;
 import com.velocitypowered.proxy.protocol.packet.config.FinishedUpdatePacket;
+import com.velocitypowered.proxy.protocol.packet.config.KnownPacksPacket;
 import com.velocitypowered.proxy.protocol.packet.config.RegistrySyncPacket;
 import com.velocitypowered.proxy.protocol.packet.config.StartUpdatePacket;
 import com.velocitypowered.proxy.protocol.packet.config.TagsUpdatePacket;
 import com.velocitypowered.proxy.protocol.util.PluginMessageUtil;
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.handler.timeout.ReadTimeoutHandler;
 import java.net.InetSocketAddress;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -256,43 +260,60 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
   public boolean handle(FinishedUpdatePacket packet) {
     MinecraftConnection smc = serverConn.ensureConnected();
     ConnectedPlayer player = serverConn.getPlayer();
-    ClientConfigSessionHandler configHandler = (ClientConfigSessionHandler) player.getConnection().getActiveSessionHandler();
 
     smc.getChannel().pipeline().get(MinecraftVarintFrameDecoder.class).setState(StateRegistry.PLAY);
     smc.getChannel().pipeline().get(MinecraftDecoder.class).setState(StateRegistry.PLAY);
 
-    // Start client-side configuration; may hold the player to apply a resource pack.
-    // noinspection DataFlowIssue
-    CompletableFuture<Void> clientFinished = configHandler.handleBackendFinishUpdate(serverConn);
+    if (player.getConnection().getActiveSessionHandler() instanceof ClientConfigSessionHandler configHandler) {
+      // Start client-side configuration; may hold the player to apply a resource pack.
+      CompletableFuture<Void> clientFinished = configHandler.handleBackendFinishUpdate(serverConn);
 
-    // Advance the backend to PLAY on whichever comes first: the client finishing, or the timeout.
-    // If the timeout wins, buffer the backend's PLAY packets until the client catches up. A delay of
-    // 0 or less advances immediately, buffering from the start without holding the backend in config.
-    final ScheduledFuture<?> splitTask = SPLIT_PHASE_DELAY_SECONDS > 0
-        ? smc.eventLoop().schedule(
-            () -> advanceBackendToPlay(true), SPLIT_PHASE_DELAY_SECONDS, TimeUnit.SECONDS)
-        : null;
-    if (splitTask == null) {
-      advanceBackendToPlay(true);
-    }
-
-    clientFinished.thenRunAsync(() -> {
-      if (splitTask != null) {
-        splitTask.cancel(false);
+      // Advance the backend to PLAY on whichever comes first: the client finishing, or the timeout.
+      // If the timeout wins, buffer the backend's PLAY packets until the client catches up. A delay
+      // of 0 or less advances immediately, buffering from the start without holding the backend in
+      // config.
+      final ScheduledFuture<?> splitTask = SPLIT_PHASE_DELAY_SECONDS > 0
+          ? smc.eventLoop().schedule(
+              () -> advanceBackendToPlay(true), SPLIT_PHASE_DELAY_SECONDS, TimeUnit.SECONDS)
+          : null;
+      if (splitTask == null) {
+        advanceBackendToPlay(true);
       }
-      // Client won the race: advance now (already in PLAY, no buffering) and drain anything the
-      // timeout may have buffered.
+
+      clientFinished.thenRunAsync(() -> {
+        if (splitTask != null) {
+          splitTask.cancel(false);
+        }
+        // Client won the race: advance now (already in PLAY, no buffering) and drain anything the
+        // timeout may have buffered.
+        advanceBackendToPlay(false);
+        smc.removePlayPacketQueueInboundHandler();
+
+        if (player.resourcePackHandler().getFirstAppliedPack() == null && resourcePackToApply != null) {
+          player.resourcePackHandler().queueResourcePack(resourcePackToApply);
+        }
+      }, smc.eventLoop()).exceptionally(ex -> {
+        LOGGER.error("Error advancing backend {} to play for {}",
+            serverConn.getServerInfo().getName(), player.getUsername(), ex);
+        return null;
+      });
+    } else {
+      // Client already left CONFIG; manually re-send brand and advance immediately.
+      final String brand = serverConn.getPlayer().getClientBrand();
+      if (brand != null) {
+        final ByteBuf buf = Unpooled.buffer();
+        ProtocolUtils.writeString(buf, brand);
+        final PluginMessagePacket brandPacket = new PluginMessagePacket("minecraft:brand", buf);
+        smc.write(brandPacket);
+      }
+
+      // Advance immediately with no buffering, since the client is already in PLAY.
       advanceBackendToPlay(false);
-      smc.removePlayPacketQueueInboundHandler();
 
       if (player.resourcePackHandler().getFirstAppliedPack() == null && resourcePackToApply != null) {
         player.resourcePackHandler().queueResourcePack(resourcePackToApply);
       }
-    }, smc.eventLoop()).exceptionally(ex -> {
-      LOGGER.error("Error advancing backend {} to play for {}",
-          serverConn.getServerInfo().getName(), player.getUsername(), ex);
-      return null;
-    });
+    }
     return true;
   }
 
@@ -380,6 +401,28 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
               }
             }, serverConn.ensureConnected().eventLoop());
     return true;
+  }
+
+  @Override
+  public boolean handle(KnownPacksPacket packet) {
+    // Server expects us to reply to this packet. If the client has already left CONFIG, reply
+    // directly with the filtered list instead of forcing the client back into reconfiguration.
+    if (serverConn.getPlayer().getConnection().getState() != StateRegistry.CONFIG) {
+      List<KnownPacksPacket.KnownPack> clientPacks = List.of(
+          new KnownPacksPacket.KnownPack(
+              "minecraft",
+              "core",
+              serverConn.getPlayer().getProtocolVersion().getVersionIntroducedIn()
+          )
+      );
+      List<KnownPacksPacket.KnownPack> filtered = packet.getPacks().stream()
+          .distinct()
+          .filter(clientPacks::contains)
+          .toList();
+      serverConn.ensureConnected().write(new KnownPacksPacket(filtered));
+      return true;
+    }
+    return false; // forward
   }
 
   @Override
